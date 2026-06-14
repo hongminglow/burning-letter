@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Burning Letter</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
+  #c { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ *  Burning handwritten letter — pure canvas, no external libraries.
+ *
+ *  The burn is driven by a per-pixel "threshold" field on an offscreen
+ *  paper buffer: threshold = distance-from-ignition perturbed by fractal
+ *  noise. A global burn front `f` advances over time; for each pixel the
+ *  local burn amount b = f - threshold maps to one of:
+ *      b < 0          unburned (with a faint pre-scorch lip)
+ *      0 .. S         scorched (browning)
+ *      S .. S+C       charred (black, glowing at the edge)
+ *      >= S+C         gone (transparent — desk shows through)
+ *  Pixels are kept sorted by threshold so each frame only the thin active
+ *  band is recomputed, which keeps it comfortably at 60fps.
+ * ------------------------------------------------------------------ */
+
+const cv  = document.getElementById('c');
+const ctx = cv.getContext('2d');
+
+let DPR = 1, W = 0, H = 0;
+let paper = { x: 0, y: 0, w: 0, h: 0 };
+
+// offscreen paper buffer
+let bw, bh, N;
+let orig, thr, sortedIdx, thrSortedVal, work, pc, pctx;
+let gonePtr = 0, bandHi = 0;
+let minThr = 0, maxThr = 1, fMax = 1.2;
+
+// desk
+let deskCanvas, dctx;
+
+// burn-front tuning (in threshold units)
+const BUF_Q      = 0.85;   // buffer resolution vs. paper screen size
+const S          = 0.052;  // scorch band width
+const C          = 0.044;  // char band width
+const GONE       = S + C;  // gone boundary
+const SCORCH_PRE = 0.020;  // faint browning ahead of the front
+const IGNITE     = 2.0;    // seconds before ignition
+const BURN_DUR   = 13.0;   // seconds to fully consume the page
+
+// particles
+let flames = [], embers = [], smokes = [], ashes = [];
+const FLAME_MAX = 420, EMBER_MAX = 280, SMOKE_MAX = 90;
+
+// sprites
+let spCore, spMid, spTip, spSmoke;
+
+// timeline / lighting
+let startTime = null, lastTime = null;
+let lightX = 0, lightY = 0, lightA = 0;
+let ashSpawned = false;
+
+/* ----------------------------- noise ------------------------------ */
+function rand2(ix, iy) {
+  let n = (ix * 374761393 + iy * 668265263) | 0;
+  n = (n ^ (n >> 13));
+  n = (n * 1274126177) | 0;
+  n = n ^ (n >> 16);
+  return ((n >>> 0) / 4294967295);
+}
+function vnoise(x, y) {
+  const x0 = Math.floor(x), y0 = Math.floor(y);
+  const fx = x - x0, fy = y - y0;
+  const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  const n00 = rand2(x0, y0),     n10 = rand2(x0 + 1, y0);
+  const n01 = rand2(x0, y0 + 1), n11 = rand2(x0 + 1, y0 + 1);
+  const a = n00 + (n10 - n00) * sx;
+  const b = n01 + (n11 - n01) * sx;
+  return a + (b - a) * sy;
+}
+function fbm(x, y) {
+  let v = 0, amp = 0.5, f = 1;
+  for (let o = 0; o < 4; o++) { v += amp * vnoise(x * f, y * f); f *= 2; amp *= 0.5; }
+  return v;
+}
+
+/* --------------------------- utilities ---------------------------- */
+function makeRadial(d, stops) {
+  const c = document.createElement('canvas');
+  c.width = c.height = d;
+  const g = c.getContext('2d');
+  const r = d / 2;
+  const grd = g.createRadialGradient(r, r, 0, r, r, r);
+  for (const s of stops) grd.addColorStop(s[0], s[1]);
+  g.fillStyle = grd;
+  g.fillRect(0, 0, d, d);
+  return c;
+}
+function rr(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+
+/* ---------------------------- the desk ---------------------------- */
+function renderDesk() {
+  deskCanvas = document.createElement('canvas');
+  deskCanvas.width = W; deskCanvas.height = H;
+  dctx = deskCanvas.getContext('2d');
+
+  // base
+  const g = dctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#2a1c11');
+  g.addColorStop(1, '#160d06');
+  dctx.fillStyle = g;
+  dctx.fillRect(0, 0, W, H);
+
+  // horizontal planks with grain
+  const plankH = Math.max(70, H / 7);
+  for (let py = 0; py < H; py += plankH) {
+    const tone = 18 + Math.floor(rand2(py | 0, 7) * 22);
+    dctx.fillStyle = `rgb(${tone + 14},${tone + 4},${tone - 6})`;
+    dctx.fillRect(0, py, W, plankH - 2);
+    // groove
+    dctx.fillStyle = 'rgba(0,0,0,0.55)';
+    dctx.fillRect(0, py + plankH - 2, W, 2);
+    // grain lines
+    dctx.strokeStyle = 'rgba(0,0,0,0.10)';
+    dctx.lineWidth = 1;
+    const lines = 5;
+    for (let i = 0; i < lines; i++) {
+      const ly = py + (i + 0.5) * (plankH / lines);
+      dctx.beginPath();
+      for (let x = 0; x <= W; x += 24) {
+        const yy = ly + Math.sin(x * 0.012 + i * 1.3 + py) * 3 + (rand2(x | 0, (ly + i) | 0) - 0.5) * 2;
+        x === 0 ? dctx.moveTo(x, yy) : dctx.lineTo(x, yy);
+      }
+      dctx.stroke();
+    }
+  }
+
+  // baked soft shadow / heat-mark where the paper rests
+  dctx.save();
+  dctx.shadowColor = 'rgba(0,0,0,0.55)';
+  dctx.shadowBlur = 36;
+  dctx.shadowOffsetX = 6;
+  dctx.shadowOffsetY = 14;
+  dctx.fillStyle = 'rgba(0,0,0,0.30)';
+  rr(dctx, paper.x, paper.y, paper.w, paper.h, 8);
+  dctx.fill();
+  dctx.restore();
+
+  // vignette
+  const vg = dctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.25,
+                                       W / 2, H / 2, Math.max(W, H) * 0.75);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.6)');
+  dctx.fillStyle = vg;
+  dctx.fillRect(0, 0, W, H);
+}
+
+/* ------------------------- the paper + ink ------------------------ */
+function squiggle(g, x, y, len, h) {
+  // a single cursive "word": humped baseline with occasional asc/descenders
+  g.beginPath();
+  const steps = Math.max(10, (len / 2.2) | 0);
+  const hump = 0.55 + rand2(x | 0, y | 0) * 0.25;        // hump frequency
+  const phase = rand2((x * 3) | 0, (y * 5) | 0) * 6.28;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const px = x + t * len;
+    let py = y
+      + Math.sin(t * len * hump + phase) * (h * 0.42)     // letter humps
+      + Math.sin(t * len * 0.11) * (h * 0.18)             // gentle baseline drift
+      + (rand2((px * 2) | 0, (y + i) | 0) - 0.5) * (h * 0.18); // jitter
+    // sparse ascenders / descenders
+    const r = rand2((px * 7) | 0, (y * 11 + i) | 0);
+    if (r > 0.965) py -= h * 0.9;
+    else if (r < 0.03) py += h * 0.7;
+    i === 0 ? g.moveTo(px, py) : g.lineTo(px, py);
+  }
+  g.stroke();
+}
+
+function cursiveLine(g, x, y, width, h, ink) {
+  g.strokeStyle = ink;
+  g.lineWidth = Math.max(1, h * 0.13);
+  g.lineJoin = 'round';
+  g.lineCap = 'round';
+  let cx = x;
+  let guard = 0;
+  while (cx < x + width && guard++ < 60) {
+    let wlen = h * (1.4 + rand2((cx | 0), (y | 0)) * 3.2);
+    if (cx + wlen > x + width) wlen = x + width - cx;
+    if (wlen < h * 0.6) break;
+    squiggle(g, cx, y, wlen, h);
+    cx += wlen + h * (0.5 + rand2((cx * 2) | 0, y | 0) * 0.7);
+  }
+}
+
+function renderPaper() {
+  bw = Math.round(paper.w * BUF_Q);
+  bh = Math.round(paper.h * BUF_Q);
+  N = bw * bh;
+
+  pc = document.createElement('canvas');
+  pc.width = bw; pc.height = bh;
+  pctx = pc.getContext('2d');
+  const g = pctx;
+
+  const rad = bh * 0.012;
+  g.save();
+  rr(g, 0, 0, bw, bh, rad);
+  g.clip();
+
+  // aged cream base
+  const base = g.createLinearGradient(0, 0, bw * 0.3, bh);
+  base.addColorStop(0, '#f4ecd6');
+  base.addColorStop(0.5, '#ece0c0');
+  base.addColorStop(1, '#e2d2a9');
+  g.fillStyle = base;
+  g.fillRect(0, 0, bw, bh);
+
+  // edge yellowing / vignette on the paper itself
+  const pv = g.createRadialGradient(bw / 2, bh / 2, bh * 0.2, bw / 2, bh / 2, bh * 0.72);
+  pv.addColorStop(0, 'rgba(120,90,40,0)');
+  pv.addColorStop(1, 'rgba(120,80,30,0.28)');
+  g.fillStyle = pv;
+  g.fillRect(0, 0, bw, bh);
+
+  // foxing speckles
+  for (let i = 0; i < bw * bh / 900; i++) {
+    const sx = rand2(i, 1) * bw, sy = rand2(i, 2) * bh;
+    const rr2 = 0.6 + rand2(i, 3) * 2.2;
+    g.fillStyle = `rgba(120,80,40,${0.04 + rand2(i, 4) * 0.07})`;
+    g.beginPath();
+    g.arc(sx, sy, rr2, 0, 6.2832);
+    g.fill();
+  }
+
+  // ink — varied sepia
+  const ink = 'rgba(54,40,24,0.86)';
+  const margin = bw * 0.13;
+  const colW = bw - margin * 2;
+  const lh = bh * 0.052;        // line height
+  const letterH = lh * 0.62;
+
+  // date (short, upper right)
+  cursiveLine(g, bw - margin - colW * 0.32, bh * 0.10, colW * 0.32, letterH * 0.9, ink);
+  // greeting (indented short line)
+  cursiveLine(g, margin, bh * 0.18, colW * 0.45, letterH * 1.15, ink);
+
+  // body
+  let y = bh * 0.265;
+  const bodyLines = 11;
+  for (let i = 0; i < bodyLines; i++) {
+    const w = colW * (i === bodyLines - 1 ? 0.55 : 0.82 + rand2(i, 9) * 0.16);
+    cursiveLine(g, margin, y, w, letterH, ink);
+    y += lh;
+  }
+
+  // closing + signature (right aligned, larger flourish)
+  cursiveLine(g, margin + colW * 0.30, bh * 0.86, colW * 0.40, letterH * 1.05, ink);
+  cursiveLine(g, margin + colW * 0.40, bh * 0.915, colW * 0.42, letterH * 1.5, 'rgba(40,30,18,0.9)');
+
+  g.restore();
+
+  // capture original pixels & set up working buffer
+  const img = pctx.getImageData(0, 0, bw, bh);
+  orig = new Uint8ClampedArray(img.data);
+  work = img; // work.data starts identical to orig (unburned)
+}
+
+/* --------------------- threshold field + sort --------------------- */
+function buildThreshold() {
+  thr = new Float32Array(N);
+  const bx = bw - 1, by = bh - 1;             // ignition: bottom-right
+  const diag = Math.hypot(bw, bh);
+  const ns = 9 / bw;                          // noise feature scale
+  const amp = 0.17;
+  minThr = Infinity; maxThr = -Infinity;
+
+  let i = 0;
+  for (let oy = 0; oy < bh; oy++) {
+    for (let ox = 0; ox < bw; ox++, i++) {
+      const dx = ox - bx, dy = oy - by;
+      const d = Math.hypot(dx, dy) / diag;     // 0 .. ~1
+      const n = fbm(ox * ns, oy * ns);         // 0 .. 1
+      // wavy front + slight upward climb bias (fire rises)
+      let t = d - amp * (n - 0.5) * 2 - (1 - oy / bh) * 0.045;
+      thr[i] = t;
+      if (t < minThr) minThr = t;
+      if (t > maxThr) maxThr = t;
+    }
+  }
+  // shift so the lowest threshold (the ignition point) is 0 — burning
+  // then begins right at the 2s mark without changing the total duration
+  for (let k = 0; k < N; k++) thr[k] -= minThr;
+  maxThr -= minThr;
+  minThr = 0;
+  fMax = maxThr + GONE + 0.03;
+
+  // sort pixel indices by threshold (one-time)
+  const idxArr = new Array(N);
+  for (let k = 0; k < N; k++) idxArr[k] = k;
+  idxArr.sort((a, b) => thr[a] - thr[b]);
+  sortedIdx = Uint32Array.from(idxArr);
+  thrSortedVal = new Float32Array(N);
+  for (let k = 0; k < N; k++) thrSortedVal[k] = thr[sortedIdx[k]];
+
+  gonePtr = 0; bandHi = 0;
+}
+
+/* ----------------------- per-frame burn update -------------------- */
+function updateBurn(f, t) {
+  const d = work.data;
+
+  // pixels fully consumed -> transparent (one-time)
+  while (gonePtr < N && thrSortedVal[gonePtr] <= f - GONE) {
+    d[sortedIdx[gonePtr] * 4 + 3] = 0;
+    gonePtr++;
+  }
+  // extend active band up to the pre-scorch lip
+  while (bandHi < N && thrSortedVal[bandHi] <= f + SCORCH_PRE) bandHi++;
+
+  const flick = 0.45 + 0.55 * Math.abs(Math.sin(t * 19.0));
+
+  for (let k = gonePtr; k < bandHi; k++) {
+    const idx = sortedIdx[k];
+    const o = idx * 4;
+    if (orig[o + 3] === 0) { d[o + 3] = 0; continue; } // outside the page
+
+    const b = f - thr[idx];
+    const or = orig[o], og = orig[o + 1], ob = orig[o + 2];
+    let r, gr, bl, a = 255;
+
+    if (b < 0) {
+      // faint pre-scorch browning
+      const s = (b + SCORCH_PRE) / SCORCH_PRE;        // 0..1
+      const w2 = 0.20 * s;
+      r  = or * (1 - w2) + 165 * w2;
+      gr = og * (1 - w2) + 120 * w2;
+      bl = ob * (1 - w2) + 70  * w2;
+    } else if (b < S) {
+      // scorch — deepening brown
+      const s = b / S;                                // 0..1
+      const brr = 158 - 78 * s, bgg = 104 - 64 * s, bbb = 58 - 40 * s;
+      const w2 = 0.28 + 0.66 * s;
+      r  = or * (1 - w2) + brr * w2;
+      gr = og * (1 - w2) + bgg * w2;
+      bl = ob * (1 - w2) + bbb * w2;
+    } else {
+      // char — dark, with smoldering glow + soft dissolve at the edge
+      const c = (b - S) / C;                          // 0..1
+      const k = 1 - c * 0.72;
+      r = 42 * k; gr = 25 * k; bl = 17 * k;
+      let gl = clamp((c - 0.5) / 0.5, 0, 1);
+      gl *= gl * (0.35 + 0.65 * flick) * (0.4 + 0.6 * rand2(idx, 3));
+      r += 235 * gl; gr += 95 * gl; bl += 22 * gl;
+      if (c > 0.80) a = 255 * (1 - (c - 0.80) / 0.20);
+    }
+
+    d[o] = r; d[o + 1] = gr; d[o + 2] = bl; d[o + 3] = a;
+  }
+
+  pctx.putImageData(work, 0, 0);
+}
+
+/* ----------------------------- particles -------------------------- */
+function spawnFlame(x, y) {
+  if (flames.length >= FLAME_MAX) return;
+  flames.push({
+    x, y,
+    vx: (rand2((x * 7) | 0, (y * 3) | 0) - 0.5) * 34,
+    vy: -(50 + rand2((x | 0), (y * 2) | 0) * 70),
+    size: 13 + rand2((x * 2) | 0, (y * 5) | 0) * 18,
+    life: 0.34 + rand2((x | 0), (y | 0)) * 0.42,
+    maxLife: 0, seed: rand2((x * 5) | 0, (y * 7) | 0) * 6.28
+  });
+  const p = flames[flames.length - 1]; p.maxLife = p.life;
+}
+function spawnEmber(x, y) {
+  if (embers.length >= EMBER_MAX) return;
+  const seed = rand2((x * 11) | 0, (y * 13) | 0) * 6.28;
+  embers.push({
+    x, y,
+    vx: (rand2((x | 0), (y | 0)) - 0.5) * 26,
+    vy: -(40 + rand2((x * 3) | 0, (y | 0)) * 60),
+    r: 0.9 + rand2((x | 0), (y * 2) | 0) * 1.7,
+    life: 1.1 + rand2((x | 0), (y * 4) | 0) * 2.0,
+    maxLife: 0, seed
+  });
+  const p = embers[embers.length - 1]; p.maxLife = p.life;
+}
+function spawnSmoke(x, y) {
+  if (smokes.length >= SMOKE_MAX) return;
+  smokes.push({
+    x, y: y - 6,
+    vx: (rand2((x | 0), (y | 0)) - 0.5) * 14,
+    vy: -(22 + rand2((x * 2) | 0, (y | 0)) * 26),
+    r: 10 + rand2((x | 0), (y * 3) | 0) * 14,
+    grow: 26 + rand2((x | 0), (y | 0)) * 30,
+    alpha: 0.06 + rand2((x * 3) | 0, (y | 0)) * 0.06,
+    life: 2.4 + rand2((x | 0), (y * 5) | 0) * 2.2,
+    maxLife: 0, seed: rand2((x * 9) | 0, (y | 0)) * 6.28
+  });
+  const p = smokes[smokes.length - 1]; p.maxLife = p.life;
+}
+function spawnAsh(x, y) {
+  ashes.push({
+    x, y,
+    life: 4.5 + rand2((x | 0), (y | 0)) * 4.0,
+    maxLife: 0,
+    r: 1.5 + rand2((x * 2) | 0, (y | 0)) * 2.2,
+    seed: rand2((x * 5) | 0, (y * 3) | 0) * 6.28
+  });
+  const p = ashes[ashes.length - 1]; p.maxLife = p.life;
+}
+
+/* ---------------------- emission along the front ------------------ */
+function emit(t) {
+  const frontN = bandHi - gonePtr;
+  let accX = 0, accY = 0, accN = 0;
+
+  if (t >= IGNITE && gonePtr < N && frontN > 0) {
+    const window = Math.min(frontN, 900);             // stay near leading edge
+    const nF = Math.min(11, 2 + (window / 110)) | 0;
+    const sxk = paper.w / bw, syk = paper.h / bh;
+
+    for (let s = 0; s < nF; s++) {
+      const k = gonePtr + ((rand2((s * 31 + t * 997) | 0, s * 7) * window) | 0);
+      if (k >= N) continue;
+      const idx = sortedIdx[k];
+      if (orig[idx * 4 + 3] === 0) continue;          // skip non-paper
+      const ox = idx % bw, oy = (idx / bw) | 0;
+      const px = paper.x + (ox + 0.5) * sxk;
+      const py = paper.y + (oy + 0.5) * syk;
+
+      spawnFlame(px, py);
+      accX += px; accY += py; accN++;
+
+      const rr3 = rand2((s * 13 + t * 131) | 0, s);
+      if (rr3 > 0.62) spawnEmber(px, py);
+      if (rr3 > 0.90) spawnSmoke(px, py);
+    }
+  }
+
+  // warm flickering desk light follows the centroid of the front
+  let targetA = 0;
+  if (accN > 0) {
+    lightX = accX / accN;
+    lightY = accY / accN;
+    const grow = clamp(frontN / 2200, 0.25, 1.0);
+    const fl = 0.7 + 0.3 * Math.sin(t * 13.0) * Math.sin(t * 5.7);
+    targetA = grow * (0.75 + 0.25 * fl);
+  }
+  lightA += (targetA - lightA) * 0.12;
+
+  // a few resting ash fragments once the page is gone
+  if (gonePtr >= N && !ashSpawned && t > IGNITE) {
+    ashSpawned = true;
+    for (let i = 0; i < 7; i++) {
+      const px = paper.x + paper.w * (0.2 + rand2(i, 17) * 0.6);
+      const py = paper.y + paper.h * (0.2 + rand2(i, 23) * 0.65);
+      spawnAsh(px, py);
+    }
+  }
+}
+
+/* --------------------------- update phys -------------------------- */
+function updateParticles(dt, t) {
+  for (let i = flames.length - 1; i >= 0; i--) {
+    const p = flames[i];
+    p.life -= dt;
+    if (p.life <= 0) { flames.splice(i, 1); continue; }
+    p.vy -= 55 * dt;                                  // buoyancy
+    p.vx += Math.sin(p.y * 0.05 + t * 6 + p.seed) * 20 * dt; // lick
+    p.vx *= 0.99;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (let i = embers.length - 1; i >= 0; i--) {
+    const p = embers[i];
+    p.life -= dt;
+    if (p.life <= 0) { embers.splice(i, 1); continue; }
+    p.vy -= 20 * dt;                                  // buoyancy up
+    p.vy += 7 * dt;                                   // a little gravity
+    p.vx += Math.sin(p.y * 0.04 + t * 1.8 + p.seed) * 16 * dt; // turbulence
+    p.vx *= 0.985; p.vy *= 0.99;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (let i = smokes.length - 1; i >= 0; i--) {
+    const p = smokes[i];
+    p.life -= dt;
+    if (p.life <= 0) { smokes.splice(i, 1); continue; }
+    p.vy -= 8 * dt;
+    p.vx += Math.sin(p.y * 0.02 + t * 1.1 + p.seed) * 10 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.r += p.grow * dt;
+  }
+  for (let i = ashes.length - 1; i >= 0; i--) {
+    const p = ashes[i];
+    p.life -= dt;
+    if (p.life <= 0) { ashes.splice(i, 1); continue; }
+  }
+}
+
+/* ------------------------------ draw ------------------------------ */
+function drawFlameSprite(sp, x, y, d, alpha) {
+  ctx.globalAlpha = alpha;
+  // anchored near the base, stretched upward so it licks up
+  ctx.drawImage(sp, x - d / 2, y - d * 0.82, d, d * 1.55);
+}
+
+function draw(t) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+
+  // desk
+  ctx.drawImage(deskCanvas, 0, 0, W, H);
+
+  // warm light cast onto the desk
+  if (lightA > 0.01) {
+    ctx.globalCompositeOperation = 'lighter';
+    const fl = 0.8 + 0.2 * Math.sin(t * 24 + 1.3);
+    let grd = ctx.createRadialGradient(lightX, lightY, 0, lightX, lightY, 300);
+    grd.addColorStop(0, `rgba(255,150,55,${0.42 * lightA * fl})`);
+    grd.addColorStop(1, 'rgba(255,120,40,0)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, W, H);
+    grd = ctx.createRadialGradient(lightX, lightY, 0, lightX, lightY, 130);
+    grd.addColorStop(0, `rgba(255,205,130,${0.38 * lightA * fl})`);
+    grd.addColorStop(1, 'rgba(255,180,90,0)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // paper
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.drawImage(pc, paper.x, paper.y, paper.w, paper.h);
+
+  // smoke (behind flames)
+  ctx.globalCompositeOperation = 'source-over';
+  for (const p of smokes) {
+    const af = p.life / p.maxLife;
+    const a = p.alpha * Math.sin(clamp(af, 0, 1) * Math.PI);
+    if (a <= 0) continue;
+    ctx.globalAlpha = a;
+    const d = p.r * 2;
+    ctx.drawImage(spSmoke, p.x - d / 2, p.y - d / 2, d, d);
+  }
+
+  // flames (additive, layered)
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of flames) {
+    const af = p.life / p.maxLife;                    // 1 -> 0
+    const fl = 0.8 + 0.2 * Math.sin(t * 30 + p.seed);
+    const size = p.size * (0.4 + 0.6 * af) * fl;
+    drawFlameSprite(spTip, p.x, p.y, size * 1.55, 0.42 * af);
+    drawFlameSprite(spMid, p.x, p.y, size * 1.05, 0.62 * af);
+    if (af > 0.45) drawFlameSprite(spCore, p.x, p.y, size * 0.62, 0.85 * (af - 0.45) / 0.55);
+  }
+
+  // embers (additive points, orange -> gray)
+  for (const p of embers) {
+    const af = clamp(p.life / p.maxLife, 0, 1);
+    const fl = 0.7 + 0.3 * Math.sin(t * 18 + p.seed);
+    const R = 120 + (255 - 120) * af;
+    const G = 120 + (165 - 120) * af;
+    const B = 125 + (55 - 125) * af;
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = `rgba(${R | 0},${G | 0},${B | 0},${0.35 * af * fl})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 2.4, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = `rgba(${R | 0},${G | 0},${B | 0},${0.95 * af})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.2832); ctx.fill();
+  }
+
+  // resting ash fragments, slowly dimming
+  for (const p of ashes) {
+    const af = clamp(p.life / p.maxLife, 0, 1);
+    const fl = 0.55 + 0.45 * Math.sin(t * 6 + p.seed);
+    const a = af * fl;
+    ctx.fillStyle = `rgba(255,110,35,${0.5 * a})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 2.2, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = `rgba(255,180,110,${0.9 * a})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 0.8, 0, 6.2832); ctx.fill();
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+}
+
+/* ------------------------------ loop ------------------------------ */
+function frame(now) {
+  if (startTime === null) { startTime = now; lastTime = now; }
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  if (dt > 0.05) dt = 0.05;                            // clamp after stalls
+  const t = (now - startTime) / 1000;
+
+  const f = (t < IGNITE) ? -0.1 : fMax * Math.min(1, (t - IGNITE) / BURN_DUR);
+
+  updateBurn(f, t);
+  emit(t);
+  updateParticles(dt, t);
+  draw(t);
+
+  requestAnimationFrame(frame);
+}
+
+/* ------------------------------ init ------------------------------ */
+function init() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  cv.style.width = W + 'px';
+  cv.style.height = H + 'px';
+
+  // paper geometry (portrait, centred, slightly above middle)
+  const ph = Math.min(H * 0.82, 820);
+  const pw = ph * 0.71;
+  paper = { x: (W - pw) / 2, y: (H - ph) / 2 - H * 0.02, w: pw, h: ph };
+
+  // sprites
+  spCore = makeRadial(64, [
+    [0, 'rgba(255,255,238,1)'], [0.35, 'rgba(255,244,180,0.9)'],
+    [0.7, 'rgba(255,210,110,0.35)'], [1, 'rgba(255,190,80,0)']
+  ]);
+  spMid = makeRadial(80, [
+    [0, 'rgba(255,180,55,0.9)'], [0.5, 'rgba(255,115,25,0.5)'], [1, 'rgba(200,55,0,0)']
+  ]);
+  spTip = makeRadial(96, [
+    [0, 'rgba(225,70,15,0.5)'], [0.5, 'rgba(170,35,5,0.26)'], [1, 'rgba(90,15,0,0)']
+  ]);
+  spSmoke = makeRadial(160, [
+    [0, 'rgba(120,116,120,0.55)'], [0.55, 'rgba(95,92,100,0.22)'], [1, 'rgba(70,68,78,0)']
+  ]);
+
+  renderDesk();
+  renderPaper();
+  buildThreshold();
+
+  // reset state
+  flames = []; embers = []; smokes = []; ashes = [];
+  ashSpawned = false; lightA = 0;
+  startTime = null; lastTime = null;
+}
+
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(init, 200);
+});
+
+init();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
